@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.util.Base64
 import android.util.Log
+import android.view.accessibility.AccessibilityNodeInfo
 import com.neuralbridge.companion.gesture.GestureEngine
 import com.neuralbridge.companion.input.InputEngine
 import com.neuralbridge.companion.notification.NotificationListener
@@ -133,15 +134,22 @@ class McpToolHandler(
         val maxDepth = args["max_depth"]?.jsonPrimitive?.intOrNull ?: 0
         val filter = args["filter"]?.jsonPrimitive?.contentOrNull ?: "interactive"
 
-        val rootNode = service.rootInActiveWindow
+        var rootNode = service.rootInActiveWindow
             ?: return errorResult("No active window available")
 
-        val tree = uiTreeWalker.walkTree(rootNode, includeInvisible, maxDepth)
+        var tree = uiTreeWalker.walkTree(rootNode, includeInvisible, maxDepth)
+        var filtered = filterTreeElements(tree, filter)
 
-        val filtered = when (filter) {
-            "all" -> tree.elements
-            "text" -> tree.elements.filter { !it.text.isNullOrEmpty() || !it.contentDescription.isNullOrEmpty() }
-            else -> tree.elements.filter { it.clickable || it.focusable || it.scrollable || it.checkable || !it.text.isNullOrEmpty() || !it.contentDescription.isNullOrEmpty() }
+        // Compose-heavy apps (e.g. Play Store) briefly expose a skeleton window with no
+        // useful nodes, and the active window can be mid-transition. Poll briefly instead
+        // of returning an empty tree and forcing the client to retry blindly.
+        var attempts = 0
+        while (filtered.isEmpty() && attempts < 6) {
+            delay(120L)
+            rootNode = service.rootInActiveWindow ?: break
+            tree = uiTreeWalker.walkTree(rootNode, includeInvisible, maxDepth)
+            filtered = filterTreeElements(tree, filter)
+            attempts++
         }
 
         val table = buildString {
@@ -164,9 +172,19 @@ class McpToolHandler(
             put("total", tree.totalNodes)
             put("shown", filtered.size)
             put("filter", filter)
+            put("attempts", attempts + 1)
             put("elements", table.trimEnd())
         }
         return textResult(result.toString())
+    }
+
+    private fun filterTreeElements(tree: UiTree, filter: String): List<UiElement> = when (filter) {
+        "all" -> tree.elements
+        "text" -> tree.elements.filter { !it.text.isNullOrEmpty() || !it.contentDescription.isNullOrEmpty() }
+        else -> tree.elements.filter {
+            it.clickable || it.focusable || it.scrollable || it.checkable ||
+                !it.text.isNullOrEmpty() || !it.contentDescription.isNullOrEmpty()
+        }
     }
 
     private suspend fun handleScreenshot(args: JsonObject): McpToolCallResult {
@@ -499,26 +517,22 @@ class McpToolHandler(
         val elementText = args["element_text"]?.jsonPrimitive?.contentOrNull
 
         val rootNode = service.rootInActiveWindow ?: return errorResult("No active window")
-        val tree = uiTreeWalker.walkTree(rootNode)
 
-        val target = if (resourceId != null || elementText != null) {
-            resolveSelector(tree, elementText, resourceId, null)
-                ?: return errorResult("Element not found: resource_id=$resourceId, text=$elementText")
-        } else {
-            tree.elements.firstOrNull { e ->
-                e.focusable && (
-                    e.className?.contains("EditText") == true ||
-                    e.className?.contains("TextField") == true ||
-                    e.className == "android.widget.AutoCompleteTextView" ||
-                    e.className?.contains("SearchView") == true
-                )
+        // Resolve the live AccessibilityNodeInfo directly. The previous implementation
+        // serialized the tree, picked an element, then tried to re-find it by resource id
+        // or text. Compose/WebView fields (e.g. Play Store's search box) expose neither,
+        // which produced "Could not get node reference for element" on valid fields.
+        val nodeInfo = when {
+            resourceId != null -> findByViewId(rootNode, resourceId)
+            elementText != null -> findByText(rootNode, elementText)
+            else -> findEditableNode(rootNode)
+        } ?: return errorResult(
+            if (resourceId != null || elementText != null) {
+                "Element not found: resource_id=$resourceId, text=$elementText"
+            } else {
+                "No editable element found. Specify resource_id or element_text"
             }
-                ?: return errorResult("No editable element found. Specify resource_id or element_text")
-        }
-
-        // Walk node tree to find matching AccessibilityNodeInfo by resource ID or text
-        val nodeInfo = findNodeByElement(rootNode, target.resourceId, target.text)
-            ?: return errorResult("Could not get node reference for element")
+        )
 
         val success = inputEngine.inputText(nodeInfo, text, append)
         @Suppress("DEPRECATION")
@@ -526,20 +540,49 @@ class McpToolHandler(
         return if (success) textResult("{\"latency_ms\":0}") else errorResult("Input text failed")
     }
 
-    private fun findNodeByElement(
-        root: android.view.accessibility.AccessibilityNodeInfo,
-        resourceId: String?,
-        text: String?
-    ): android.view.accessibility.AccessibilityNodeInfo? {
-        if (resourceId != null) {
-            val results = root.findAccessibilityNodeInfosByViewId(resourceId)
-            if (results.isNotEmpty()) return results.first()
+    /**
+     * Find the editable node itself, preferring the focused field.
+     */
+    private fun findEditableNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val editable = walkNodes(root).filter { node ->
+            node.isEditable || node.className?.toString()?.let {
+                it.contains("EditText") || it.contains("TextField") || it.contains("SearchView")
+            } == true
+        }.toList()
+        return editable.firstOrNull { it.isFocused } ?: editable.firstOrNull()
+    }
+
+    private fun findByViewId(root: AccessibilityNodeInfo, resourceId: String): AccessibilityNodeInfo? {
+        runCatching { root.findAccessibilityNodeInfosByViewId(resourceId) }
+            .getOrNull()
+            ?.firstOrNull()
+            ?.let { return it }
+        // Some apps only expose a partial/suffix id, or report no id at all.
+        return walkNodes(root).firstOrNull { it.viewIdResourceName?.endsWith(resourceId) == true }
+    }
+
+    private fun findByText(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
+        root.findAccessibilityNodeInfosByText(text).firstOrNull()?.let { return it }
+        return walkNodes(root).firstOrNull {
+            it.text?.toString()?.contains(text, ignoreCase = true) == true ||
+                it.contentDescription?.toString()?.contains(text, ignoreCase = true) == true
         }
-        if (text != null) {
-            val results = root.findAccessibilityNodeInfosByText(text)
-            if (results.isNotEmpty()) return results.first()
+    }
+
+    /**
+     * Breadth-first walk over live nodes. Used when the serialized element cannot be
+     * mapped back to a node (Compose, WebView, games).
+     */
+    private fun walkNodes(root: AccessibilityNodeInfo): Sequence<AccessibilityNodeInfo> = sequence {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            yield(node)
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
         }
-        return null
     }
 
     private fun handlePressKey(args: JsonObject): McpToolCallResult {
