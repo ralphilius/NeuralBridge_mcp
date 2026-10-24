@@ -29,7 +29,9 @@ class McpHttpServer(
         private const val SERVER_NAME = "neuralbridge-android"
         private const val SERVER_VERSION = "0.4.0"
         private const val PROTOCOL_VERSION = "2024-11-05"
-        private const val SCREEN_WAKE_LOCK_TIMEOUT_MS = 5L * 60 * 1000 // 5 minutes
+        // Long enough to cover a slow UI operation, short enough that an idle server
+        // lets the display sleep again (screen timeout then applies normally).
+        private const val SCREEN_WAKE_LOCK_TIMEOUT_MS = 20L * 1000 // 20 seconds
     }
 
     @Volatile
@@ -110,7 +112,6 @@ class McpHttpServer(
 
     private suspend fun handleMcpPost(call: ApplicationCall) {
         lastRequestTimestamp.set(System.currentTimeMillis())
-        screenWakeLock?.acquire(SCREEN_WAKE_LOCK_TIMEOUT_MS)
 
         // CORS
         call.response.headers.append("Access-Control-Allow-Origin", "*")
@@ -130,6 +131,12 @@ class McpHttpServer(
         }
 
         Log.d(TAG, "MCP request: method=${request.method}, id=${request.id}")
+
+        // Only wake the display for tool calls. Clients also send initialize/ping/tools-list
+        // health checks; waking for those kept the screen on while the device was idle.
+        if (request.method == "tools/call") {
+            screenWakeLock?.acquire(SCREEN_WAKE_LOCK_TIMEOUT_MS)
+        }
 
         // Route by method
         val response: JsonRpcResponse? = when (request.method) {
